@@ -1,6 +1,6 @@
 """RAG pipeline for the CityCare Hospital information bot.
 
-Flow: load docs -> chunk by section -> embed (sentence-transformers) -> FAISS index
+Flow: load docs -> chunk by section -> embed (sentence-transformers) -> Chroma vector DB
 -> retrieve top-k for a question -> answer with an LLM (if configured) or extractively.
 """
 import os
@@ -8,14 +8,14 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
-import faiss
-import numpy as np
+import chromadb
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()  # reads GEMINI_API_KEY from .env if present
 
 DOC_DIR = Path(__file__).parent / "doc"
+DB_DIR = Path(__file__).parent / "chroma_db"  # persisted on disk, survives restarts
 EMBED_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL = os.getenv("LLM_MODEL", "gemini-3.6-flash")
 MIN_SCORE = 0.25  # below this cosine similarity, treat the question as out of scope
@@ -43,12 +43,23 @@ def load_chunks(doc_dir: Path = DOC_DIR) -> list[Chunk]:
 
 
 class HospitalRAG:
-    def __init__(self, doc_dir: Path = DOC_DIR):
+    def __init__(self, doc_dir: Path = DOC_DIR, db_dir: Path = DB_DIR):
         self.chunks = load_chunks(doc_dir)
-        self.model = SentenceTransformer(EMBED_MODEL)
-        vecs = self.model.encode([c.text for c in self.chunks], normalize_embeddings=True)
-        self.index = faiss.IndexFlatIP(vecs.shape[1])  # inner product == cosine (normalized)
-        self.index.add(np.asarray(vecs, dtype="float32"))
+        embed_fn = SentenceTransformerEmbeddingFunction(model_name=EMBED_MODEL)
+        # PersistentClient writes the index to disk under db_dir, so it survives restarts
+        # and doesn't need re-embedding every time the app starts (unlike the old FAISS setup).
+        client = chromadb.PersistentClient(path=str(db_dir))
+        self.collection = client.get_or_create_collection(
+            "hospital_docs", embedding_function=embed_fn, metadata={"hnsw:space": "cosine"})
+        # Re-sync if the docs changed since the last run (cheap check: chunk count).
+        if self.collection.count() != len(self.chunks):
+            client.delete_collection("hospital_docs")
+            self.collection = client.get_or_create_collection(
+                "hospital_docs", embedding_function=embed_fn, metadata={"hnsw:space": "cosine"})
+            self.collection.add(
+                ids=[str(i) for i in range(len(self.chunks))],
+                documents=[c.text for c in self.chunks],
+                metadatas=[{"source": c.source, "heading": c.heading} for c in self.chunks])
 
     @staticmethod
     def make_client(api_key: str | None = None):
@@ -60,9 +71,12 @@ class HospitalRAG:
         return genai.Client(api_key=key)
 
     def retrieve(self, question: str, k: int = 3) -> list[tuple[Chunk, float]]:
-        q = self.model.encode([question], normalize_embeddings=True)
-        scores, ids = self.index.search(np.asarray(q, dtype="float32"), k)
-        return [(self.chunks[i], float(s)) for i, s in zip(ids[0], scores[0]) if i >= 0]
+        res = self.collection.query(query_texts=[question], n_results=k)
+        hits = []
+        for doc, meta, dist in zip(res["documents"][0], res["metadatas"][0], res["distances"][0]):
+            similarity = 1 - dist  # cosine distance -> cosine similarity
+            hits.append((Chunk(doc, meta["source"], meta["heading"]), similarity))
+        return hits
 
     def answer(self, question: str, history: list[dict] | None = None, api_key: str | None = None) -> dict:
         hits = self.retrieve(question)
