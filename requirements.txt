@@ -1,5 +1,6 @@
 sentence-transformers
-chromadb
+faiss-cpu
+numpy
 streamlit
 google-genai
 python-dotenv
